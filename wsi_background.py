@@ -253,10 +253,12 @@ def subtract_background(array, methods, verbose=True):
     return result
 
 
-def napari_tile_inspector(original_dask,
+def napari_tile_inspector(zarr_path,
                           chunk_size=(1024,1024),
                           channel_names=None,
-                          channel_colors=None):
+                          channel_colors=None,
+                          zarr_level="0",
+                          display_level="0"):
     """
     Napari tile inspector with:
       - Random tile loading
@@ -265,6 +267,11 @@ def napari_tile_inspector(original_dask,
       - Clear adjusted toggle
       - Channel color defaults
     """
+    
+    # Load to dask from on disk zarr
+    store = zarr.open(zarr_path, mode='r')[zarr_level]
+    original_dask = da.from_zarr(store[display_level])
+    
     C = original_dask.shape[1]
     Y = original_dask.shape[3]
     X = original_dask.shape[4]
