@@ -316,13 +316,11 @@ def napari_tile_inspector(zarr_path,
     def wavelength_to_color(wavelength_nm):
         if wavelength_nm < 500:
             return 'blue'
-        elif 500 <= wavelength_nm < 570:
+        elif 500 <= wavelength_nm < 550:
             return 'green'
-        elif 570 <= wavelength_nm < 590:
-            return 'yellow'
-        elif 590 <= wavelength_nm < 620:
+        elif 550 <= wavelength_nm < 590:
             return 'orange'
-        elif 620 <= wavelength_nm < 750:
+        elif 590 <= wavelength_nm < 750:
             return 'red'
         else:
             return 'gray'  # fallback for IR/UV or unknown
@@ -340,7 +338,7 @@ def napari_tile_inspector(zarr_path,
     for c,name in enumerate(channel_names):
         layer = viewer.add_image(
             np.zeros(chunk_size),
-            name=f"Original - {name}",
+            name=name,
             colormap=channel_colors[c],
             blending='additive'
         )
@@ -354,26 +352,26 @@ def napari_tile_inspector(zarr_path,
                     viewer.layers.remove(nm)
             adjusted_names.clear()
 
-        yidx = random.randrange(Y//chunk_size[0])
-        xidx = random.randrange(X//chunk_size[1])
-        ys, xs = yidx*chunk_size[0], xidx*chunk_size[1]
+        yidx = random.randrange(Y // chunk_size[0])
+        xidx = random.randrange(X // chunk_size[1])
+        ys, xs = yidx * chunk_size[0], xidx * chunk_size[1]
 
         for c in range(C):
-            tile = original_dask[0,c,0,ys:ys+chunk_size[0], xs:xs+chunk_size[1]].compute()
+            tile = original_dask[0, c, 0, ys:ys + chunk_size[0], xs:xs + chunk_size[1]].compute()
             tile = tile.astype(np.uint16)
             raw_layers[c].data = tile
 
             # auto contrast
-            if tile.max()>0:
-                vmin = np.percentile(tile,1)
-                vmax = np.percentile(tile,99.5)
+            if tile.max() > 0:
+                vmin = np.percentile(tile, 1)
+                vmax = np.percentile(tile, 99.5)
             else:
-                vmin,vmax = 0,1
-            raw_layers[c].contrast_limits = (vmin,vmax)
-            if len(contrast_limits)<=c:
-                contrast_limits.append((vmin,vmax))
+                vmin, vmax = 0, 1
+            raw_layers[c].contrast_limits = (vmin, vmax)
+            if len(contrast_limits) <= c:
+                contrast_limits.append((vmin, vmax))
             else:
-                contrast_limits[c]=(vmin,vmax)
+                contrast_limits[c] = (vmin, vmax)
 
     # Random + clear toggle
     @magicgui(call_button="Random Tile", clear_adjusted={"label": "Clear adjusted"})
@@ -382,19 +380,29 @@ def napari_tile_inspector(zarr_path,
     viewer.window.add_dock_widget(btn_random, area='left', name="Tile Controls")
 
     # Sync contrast helper
-    def sync_contrast(strategy):
+    def sync_contrast(strategy: str = "union"):
+        """
+        Sync contrast limits of all layers matching each original channel name.
+        """
+        from collections import defaultdict
+
         groups = defaultdict(list)
-        for layer in viewer.layers:
-            if " - " in layer.name:
-                base = layer.name.split(" - ",1)[1]
-                groups[base].append(layer)
-        for base, layers in groups.items():
+
+        for base_name in channel_names:
+            for layer in viewer.layers:
+                if base_name in layer.name:
+                    groups[base_name].append(layer)
+
+        for base_name, layers in groups.items():
             vmins = [l.contrast_limits[0] for l in layers]
             vmaxs = [l.contrast_limits[1] for l in layers]
-            if strategy=="union":
+            if strategy == "union":
                 cl = (min(vmins), max(vmaxs))
-            else:
+            elif strategy == "intersection":
                 cl = (max(vmins), min(vmaxs))
+            else:
+                continue
+
             for l in layers:
                 l.contrast_limits = cl
 
@@ -406,20 +414,29 @@ def napari_tile_inspector(zarr_path,
     # Background GUI
     @magicgui(
         method={"choices": ["rolling_ball", "median", "morph_opening", "clahe", "rescale", "threshold"]},
-        channels_to_apply={
-            "label": "Apply to Channels",
-            "choices": lambda w: list(zip(channel_names, range(len(channel_names)))),
-            "allow_multiple": True  # <-- this is essential
+        layer_select={
+            "label": "Target Layers",
+            "choices": lambda w: [layer.name for layer in viewer.layers if isinstance(layer.data, np.ndarray)],
+            "allow_multiple": True
         },
         sigma_px={"label": "Sigma (px)", "min": 1, "max": 500, "step": 1, "value": 50},
         size_px={"label": "Size (px)", "min": 1, "max": 500, "step": 1, "value": 50},
         rescale={"label": "Rescale", "value": False},
+        autoscale_contrast={"label": "Autoscale contrast", "value": True},
         threshold={"label": "Thresh", "min": 0, "max": 1000, "step": 1, "value": 10},
         call_button="Apply"
     )
-    def apply_bg(method: str, sigma_px: int, size_px: int, rescale: bool, threshold: int, channels_to_apply: list = []):
+    def apply_bg(
+            method: str,
+            sigma_px: int,
+            size_px: int,
+            rescale: bool,
+            threshold: int,
+            autoscale_contrast: bool,
+            layer_select: list = []
+    ):
         try:
-            params = {"method": method, "channels": channels_to_apply}
+            params = {"method": method}
             if method == "rolling_ball":
                 params["sigma_px"] = sigma_px
                 if rescale:
@@ -434,31 +451,54 @@ def napari_tile_inspector(zarr_path,
                 params["in_range"] = (0, 65535)
                 params["out_range"] = "uint16"
 
-            # Assume channel axis is first in tiles (shape = (C, Y, X))
-            axis_order = 'CYX'
-            tile_stack = [raw_layers[c].data[None, ...] for c in range(len(channel_names))]
-            arr = np.concatenate(tile_stack, axis=0)
+            # Apply to selected layers, or fallback to raw tile
+            targets = layer_select or [layer.name for layer in viewer.layers if layer.name in channel_names]
 
-            show_info(f"Applying: {str(params)}, Axis order: {str(axis_order)}...")
-            corrected = subtract_background(arr, [params], axis_order=axis_order, verbose=False)
-            if isinstance(corrected, da.Array):
-                corrected = corrected.compute()
 
-            for c in channels_to_apply:
-                corr = np.squeeze(corrected[c])
-                cl = contrast_limits[c]
-                nm = f"{method} - {channel_names[c]}"
 
-                def make_add(data, name, cmap, clims):
-                    def _add():
-                        viewer.add_image(data, name=name, colormap=cmap, blending='additive', contrast_limits=clims)
-                        adjusted_names.append(name)
+            if not targets:
+                show_error("No target layers found to apply background.")
+                return
 
-                    return _add
+            for layer_name in targets:
+                layer = viewer.layers[layer_name]
+                data = layer.data
 
-                QTimer.singleShot(0, make_add(corr, nm, channel_colors[c], cl))
+                # Handle 2D vs 3D
+                if data.ndim == 2:
+                    arr = data[None, ...]
+                    axis_order = "CYX"
+                    channel_idxs = [0]
+                elif data.ndim == 3:
+                    arr = data
+                    axis_order = "CYX"
+                    channel_idxs = list(range(arr.shape[0]))
+                else:
+                    show_error(f"Unsupported array shape {data.shape} in layer '{layer_name}'")
+                    continue
 
-            show_info(f"Applied {method} to channels {channels_to_apply}")
+                # Apply background subtraction
+                methods = [dict(params, channels=channel_idxs)]
+                show_info(f"Applying: {str(methods)}. Axis order: {str(axis_order)}.")
+                corrected = subtract_background(arr, methods, axis_order=axis_order,
+                                                verbose=False)
+                if isinstance(corrected, da.Array):
+                    corrected = corrected.compute()
+
+                for c in channel_idxs:
+                    name_suffix = f"{method} - {layer_name} [C{c}]"
+
+                    if autoscale_contrast:
+                        cl = (np.percentile(corrected[c], 1), np.percentile(corrected[c], 99.5))
+                    else:
+                        cl = layer.contrast_limits
+
+                    cmap = layer.colormap.name if hasattr(layer, "colormap") else "gray"
+                    viewer.add_image(corrected[c], name=name_suffix, blending='additive', colormap=cmap,
+                                     contrast_limits=cl)
+                    adjusted_names.append(name_suffix)
+
+            show_info(f"Applied {method} to {targets}")
         except Exception as e:
             show_error(str(e))
 
