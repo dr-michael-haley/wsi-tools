@@ -163,12 +163,16 @@ def vsi_folder_to_zarr_UNUSED(raw_folder = "Images_raw",
     size_z, size_c, size_y, size_x = pixels.size_z, pixels.size_c, pixels.size_y, pixels.size_x
 
 
-def subtract_background(array, methods, verbose=True):
+def subtract_background(array, methods, axis_order='CYX', verbose=True):
     """
-    Apply background subtraction/enhancement to a Dask or NumPy (C,Y,X) array.
-    Methods is a list of dicts with:
-      - 'method': one of rolling_ball, median, morph_opening, clahe, rescale, threshold
-      - parameters: sigma_px, size_px, rescale (bool), in_range, out_range, threshold
+    Apply background subtraction to specified channels of a (possibly Dask) array.
+    Parameters:
+      - array: Dask or NumPy array with shape corresponding to axis_order.
+      - methods: List of dicts specifying:
+          - method: one of 'rolling_ball', 'median', etc.
+          - channels: list of channel indices (relative to C axis)
+          - other method-specific parameters
+      - axis_order: string like 'CYX' or 'TCZYX' describing array shape.
     """
     import numpy as np
     import dask.array as da
@@ -178,79 +182,88 @@ def subtract_background(array, methods, verbose=True):
     from scipy import ndimage
 
     is_dask = isinstance(array, da.Array)
-    result = array
-    ndim = result.ndim
+    full_ndim = array.ndim
+    channel_axis = axis_order.index('C')
+    result = array.copy()
+
+    def _slice_channel(arr, c):
+        slicer = [slice(None)] * arr.ndim
+        slicer[channel_axis] = c
+        return arr[tuple(slicer)]
+
+    def _set_channel(arr, c, new_data):
+        slicer = [slice(None)] * arr.ndim
+        slicer[channel_axis] = c
+        arr[tuple(slicer)] = new_data
+        return arr
 
     for step in methods:
         m = step["method"]
+        ch_idxs = step.get("channels", list(range(array.shape[channel_axis])))
+
         if verbose:
-            print(f"🔧 {m} params={step}")
+            print(f"🔧 {m} on channels {ch_idxs} with params={step}")
 
-        # Rolling ball / gaussian
-        if m == "rolling_ball":
-            σ = float(step.get("sigma_px", 50))
-            sigma = (0.0,)*(ndim-2)+(σ,σ)
-            fn = gaussian_filter if is_dask else lambda x: ndimage.gaussian_filter(x, sigma=sigma)
-            
-            if is_dask:
-                bg = fn(result, sigma=sigma)
+        for c in ch_idxs:
+            channel = _slice_channel(result, c)
+            ch_shape = channel.shape
+            ch_ndim = channel.ndim
+            ch_axis_order = [ax for i, ax in enumerate(axis_order) if i != channel_axis]
+            spatial_axes = [i for i, ax in enumerate(ch_axis_order) if ax in ('Y', 'X')]
+
+            if m == "rolling_ball":
+                σ = float(step.get("sigma_px", 50))
+                sigma = tuple(σ if i in spatial_axes else 0 for i in range(ch_ndim))
+                fn = gaussian_filter if is_dask else lambda x: ndimage.gaussian_filter(x, sigma=sigma)
+                bg = fn(channel, sigma=sigma) if is_dask else fn(channel)
+                sub = (channel.astype('int32') - bg.astype('int32')).clip(0).astype('uint16')
+                if step.get("rescale", False):
+                    fn2 = lambda b: rescale_intensity(b, in_range='image', out_range='uint16').astype('uint16')
+                    sub = sub.map_blocks(fn2, dtype='uint16') if is_dask else fn2(sub)
+
+            elif m == "median":
+                s = int(step.get("size_px", 50))
+                size = tuple(s if i in spatial_axes else 1 for i in range(ch_ndim))
+                fn = median_filter if is_dask else lambda x: ndimage.median_filter(x, size=size)
+                bg = fn(channel)
+                sub = (channel.astype('int32') - bg.astype('int32')).clip(0).astype('uint16')
+                if step.get("rescale", False):
+                    fn2 = lambda b: rescale_intensity(b, in_range='image', out_range='uint16').astype('uint16')
+                    sub = sub.map_blocks(fn2, dtype='uint16') if is_dask else fn2(sub)
+
+            elif m == "morph_opening":
+                s = int(step.get("size_px", 50))
+                footprint = np.ones(tuple(s if i in spatial_axes else 1 for i in range(ch_ndim)))
+                sub = (
+                    channel.map_blocks(lambda b: grey_opening(b, footprint=footprint), dtype=channel.dtype)
+                    if is_dask else
+                    grey_opening(channel, footprint=footprint)
+                )
+
+            elif m == "clahe":
+                fn = lambda b: equalize_adapthist(b.astype('float32')).astype('float32')
+                sub = channel.map_blocks(fn, dtype='float32') if is_dask else fn(channel)
+
+            elif m == "rescale":
+                ir = step.get("in_range", (0, 65535))
+                orng = step.get("out_range", 'uint16')
+                fn = lambda b: rescale_intensity(b, in_range=ir, out_range=orng).astype(orng)
+                sub = channel.map_blocks(fn, dtype=orng) if is_dask else fn(channel)
+
+            elif m == "threshold":
+                t = step.get("value", 10)
+                fn = lambda b: np.where(b < t, 0, b).astype(b.dtype)
+                sub = channel.map_blocks(fn, dtype=channel.dtype) if is_dask else fn(channel)
+
             else:
-                bg = fn(result)
-                
-            # signed subtraction
-            if is_dask:
-                result = (result.astype('int32') - bg.astype('int32')).clip(0).astype('uint16')
-            else:
-                result = np.clip(result.astype('int32')-bg.astype('int32'), 0, None).astype('uint16')
-            if step.get("rescale", False):
-                fn2 = lambda b: rescale_intensity(b, in_range='image', out_range='uint16').astype('uint16')
-                result = result.map_blocks(fn2, dtype='uint16') if is_dask else fn2(result)
+                raise ValueError(f"Unknown method {m}")
 
-        # Median
-        elif m == "median":
-            s = int(step.get("size_px", 50))
-            size = (1,)*(ndim-2)+(s,s)
-            fn = median_filter if is_dask else lambda x: ndimage.median_filter(x, size=size)
-            bg = fn(result)
-            if is_dask:
-                result = (result.astype('int32') - bg.astype('int32')).clip(0).astype('uint16')
-            else:
-                result = np.clip(result.astype('int32')-bg.astype('int32'), 0, None).astype('uint16')
-            if step.get("rescale", False):
-                fn2 = lambda b: rescale_intensity(b, in_range='image', out_range='uint16').astype('uint16')
-                result = result.map_blocks(fn2, dtype='uint16') if is_dask else fn2(result)
-
-        # Morphological opening
-        elif m == "morph_opening":
-            s = int(step.get("size_px",50))
-            footprint = np.ones((1,)*(ndim-2)+(s,s))
-            if is_dask:
-                result = result.map_blocks(lambda b: grey_opening(b, footprint=footprint), dtype=result.dtype)
-            else:
-                result = grey_opening(result, footprint=footprint)
-
-        # CLAHE
-        elif m == "clahe":
-            fn = lambda b: equalize_adapthist(b.astype('float32')).astype('float32')
-            result = result.map_blocks(fn, dtype='float32') if is_dask else fn(result)
-
-        # Rescale
-        elif m == "rescale":
-            ir = step.get("in_range",(0,65535))
-            orng = step.get("out_range",'uint16')
-            fn = lambda b: rescale_intensity(b, in_range=ir, out_range=orng).astype(orng)
-            result = result.map_blocks(fn, dtype=orng) if is_dask else fn(result)
-
-        # Threshold
-        elif m == "threshold":
-            t = step.get("value",10)
-            fn = lambda b: np.where(b<t,0,b).astype(b.dtype)
-            result = result.map_blocks(fn, dtype=result.dtype) if is_dask else fn(result)
-
-        else:
-            raise ValueError(f"Unknown method {m}")
+            result = _set_channel(result, c, sub)
 
     return result
+
+
+
 
 
 def napari_tile_inspector(zarr_path,
@@ -274,7 +287,13 @@ def napari_tile_inspector(zarr_path,
     original_dask = da.from_zarr(store[display_level])
 
     # Extract indices of different components of data (time, channels, z, y, x)
-    T, C, Z, Y, X = [channel_order.index(x) for x in "TCZYX"]
+    axis_indices = {dim: channel_order.index(dim) for dim in "TCZYX"}
+    shape = original_dask.shape
+
+    # Get the actual dimensions from shape
+    Y = shape[axis_indices["Y"]]
+    X = shape[axis_indices["X"]]
+    C = shape[axis_indices["C"]]
 
     # Read in metadata
     with open(os.path.join(zarr_path, "OME", "METADATA.ome.xml"), encoding='utf-8') as f:
@@ -386,50 +405,60 @@ def napari_tile_inspector(zarr_path,
 
     # Background GUI
     @magicgui(
-      sigma_px={"label":"Sigma (px)", "min":1, "max":500, "step":1, "value":50},
-      size_px={"label":"Size (px)", "min":1, "max":500, "step":1, "value":50},
-      rescale={"label":"Rescale","value":False},
-      threshold={"label":"Thresh","min":0,"max":1000,"step":1,"value":10},
-      method={"choices":["rolling_ball","median","morph_opening","clahe","rescale","threshold"]},
-      call_button="Apply"
+        method={"choices": ["rolling_ball", "median", "morph_opening", "clahe", "rescale", "threshold"]},
+        channels_to_apply={
+            "label": "Apply to Channels",
+            "choices": lambda w: list(zip(channel_names, range(len(channel_names)))),
+            "allow_multiple": True  # <-- this is essential
+        },
+        sigma_px={"label": "Sigma (px)", "min": 1, "max": 500, "step": 1, "value": 50},
+        size_px={"label": "Size (px)", "min": 1, "max": 500, "step": 1, "value": 50},
+        rescale={"label": "Rescale", "value": False},
+        threshold={"label": "Thresh", "min": 0, "max": 1000, "step": 1, "value": 10},
+        call_button="Apply"
     )
-    def apply_bg(method:str, sigma_px:int, size_px:int, rescale:bool, threshold:int):
+    def apply_bg(method: str, sigma_px: int, size_px: int, rescale: bool, threshold: int, channels_to_apply: list = []):
         try:
-            for c,name in enumerate(channel_names):
-                tile = raw_layers[c].data
-                if tile is None: continue
-                arr = tile[None,...]
-                params = {"method":method}
-                if method in ("rolling_ball","median"):
-                    params["sigma_px" if method=="rolling_ball" else "size_px"] = sigma_px if method=="rolling_ball" else size_px
-                    if rescale: params["rescale"]=True
-                if method=="threshold": params["value"]=threshold
-                if method=="rescale": params={"method":"rescale","in_range":(0,65535),"out_range":"uint16"}
+            params = {"method": method, "channels": channels_to_apply}
+            if method == "rolling_ball":
+                params["sigma_px"] = sigma_px
+                if rescale:
+                    params["rescale"] = True
+            elif method == "median":
+                params["size_px"] = size_px
+                if rescale:
+                    params["rescale"] = True
+            elif method == "threshold":
+                params["value"] = threshold
+            elif method == "rescale":
+                params["in_range"] = (0, 65535)
+                params["out_range"] = "uint16"
 
-                corrected = subtract_background(arr, [params], verbose=False)
-                if isinstance(corrected, da.Array):
-                    corrected=corrected.compute()
-                corrected=np.squeeze(corrected)
-                if corrected.ndim!=2: continue
+            # Assume channel axis is first in tiles (shape = (C, Y, X))
+            axis_order = 'CYX'
+            tile_stack = [raw_layers[c].data[None, ...] for c in range(len(channel_names))]
+            arr = np.concatenate(tile_stack, axis=0)
 
+            show_info(f"Applying: {str(params)}, Axis order: {str(axis_order)}...")
+            corrected = subtract_background(arr, [params], axis_order=axis_order, verbose=False)
+            if isinstance(corrected, da.Array):
+                corrected = corrected.compute()
+
+            for c in channels_to_apply:
+                corr = np.squeeze(corrected[c])
                 cl = contrast_limits[c]
-                nm = f"{method} - {name}"
-                # safe add
-                def make_do_add(data, nm, cmap, clims):
+                nm = f"{method} - {channel_names[c]}"
+
+                def make_add(data, name, cmap, clims):
                     def _add():
-                        try:
-                            viewer.add_image(data, name=nm,
-                                             colormap=cmap,
-                                             blending='additive',
-                                             contrast_limits=clims)
-                            adjusted_names.append(nm)
-                        except Exception as e:
-                            show_error(str(e))
+                        viewer.add_image(data, name=name, colormap=cmap, blending='additive', contrast_limits=clims)
+                        adjusted_names.append(name)
+
                     return _add
 
-                QTimer.singleShot(0, make_do_add(corrected, nm, channel_colors[c], cl))
-                
-            show_info("Applied "+method)
+                QTimer.singleShot(0, make_add(corr, nm, channel_colors[c], cl))
+
+            show_info(f"Applied {method} to channels {channels_to_apply}")
         except Exception as e:
             show_error(str(e))
 
@@ -450,23 +479,24 @@ def napari_tile_inspector(zarr_path,
     load_random(clear_adjusted=True)
     return viewer
 
-def build_pyramid_numpy(base, num_levels):
+def build_pyramid_numpy(base, num_levels, axis_order='TCZYX'):
     """Build a pyramid using skimage downscale on NumPy array."""
     pyramid = [base]
+    shape = base.shape
+    spatial_axes = [i for i, ax in enumerate(axis_order) if ax in ('Y', 'X')]
+
     for _ in range(1, num_levels):
-        base = downscale_local_mean(base, (1, 1, 1, 2, 2)).astype(base.dtype)
+        downscale = tuple(2 if i in spatial_axes else 1 for i in range(len(shape)))
+        base = downscale_local_mean(base, downscale).astype(base.dtype)
         pyramid.append(base)
+
     return pyramid
 
-def build_pyramid_dask(base, num_levels):
-    """Build a pyramid using Dask coarsen on Dask array."""
-    pyramid = [base]
-    for _ in range(1, num_levels):
-        base = da.coarsen(np.mean, base, {3: 2, 4: 2}, trim_excess=True)
-        pyramid.append(base)
-    return pyramid
 
-def save_modified_zarr_pyramid(zarr_path, zarr_level="0", methods=None, load_into_memory=False):
+def save_modified_zarr_pyramid(zarr_path, zarr_level="0", methods=None, load_into_memory=False, axis_order="TCZYX"):
+    import dask.array as da
+    import zarr
+    import numpy as np
 
     if methods is None:
         raise ValueError("Must provide background subtraction methods.")
@@ -481,62 +511,59 @@ def save_modified_zarr_pyramid(zarr_path, zarr_level="0", methods=None, load_int
     original_chunks = zgroup[level0_key].chunks
     print(f"📏 Level 0 shape: {level0_dask.shape}, chunks: {original_chunks}, dtype: {level0_dask.dtype}")
 
+    spatial_axes = [i for i, ax in enumerate(axis_order) if ax in ("Y", "X")]
+    coarsen_factors = {i: 2 for i in spatial_axes}
+
     if load_into_memory:
         print("🧠 Loading into memory...")
         level0_np = level0_dask.compute()
-        corrected = subtract_background(level0_np, methods=methods)
-        pyramid = build_pyramid_numpy(corrected, num_levels)
+        corrected = subtract_background(level0_np, methods=methods, axis_order=axis_order)
+        pyramid = build_pyramid_numpy(corrected, num_levels, axis_order=axis_order)
 
         for i, level in enumerate(pyramid):
             print(f"💾 Writing NumPy level {i}")
             da.from_array(level, chunks=original_chunks).to_zarr(zgroup[str(i)], overwrite=True)
     else:
         print("🐢 Using Dask lazy eval with compute/persist...")
-        corrected = subtract_background(level0_dask, methods=methods).persist()
+        corrected = subtract_background(level0_dask, methods=methods, axis_order=axis_order).persist()
         base = corrected
 
         for i in range(num_levels):
             print(f"💾 Writing Dask level {i}")
             base.to_zarr(zgroup[str(i)], overwrite=True)
-            base = da.coarsen(np.mean, base, {3: 2, 4: 2}, trim_excess=True)
+            base = da.coarsen(np.mean, base, coarsen_factors, trim_excess=True)
 
     print("✅ Zarr pyramid update complete.")
+
 
     
 def vsi_background_subtract(vsi_path, 
                             raw_folder,
-                            output_ometiff = 'pyramid_output.ome.tiff',
-                            methods = [{"method": "rolling_ball", "sigma_px": 50}],
-                            vsi_series=2, # For Olympus V200 fluorescent, this should be 2
-                            zarr_level="0", # For Olympus V200 fluorescent, this should be "0"
-                            max_workers=8, # For Java
-                            load_into_memory=False, # Whether or not to load the entire 0 resolution file into memory. Faster, but requires loads of RAM!
+                            output_ometiff='pyramid_output.ome.tiff',
+                            methods=[{"method": "rolling_ball", "sigma_px": 50}],
+                            vsi_series=2,
+                            zarr_level="0",
+                            max_workers=8,
+                            load_into_memory=False,
                             overwrite=True,
-                            patch_size=512):
-    
-    # Extract metadata using showinf, including resolutions
+                            patch_size=512,
+                            axis_order="TCZYX"):
     print(f"Using showinf to read metadata for {vsi_path}, series# {vsi_series}...\n")
     showinf_readout = run_commandline(f"showinf -nopix -noflat -series {vsi_series} {vsi_path}", verbose=1, return_readout=True)
-    
-    # Extract metadata to dictionary
     series_metadata = parse_showinf_series_metadata(showinf_readout, series_number=vsi_series)
 
     print(f'Metadata for {vsi_path}, series# {vsi_series}:')
-    for i,v in series_metadata.items():
+    for i, v in series_metadata.items():
         print(f"{i} = {v}")
-        
-    # If folder exists, then must have overwrite enabld
+
     if not os.path.isdir(raw_folder) or overwrite:
         print('\nConverting .vsi whole slide image files into zarr folder...')
-        # Covert VSI to zarr-comptaible folder using 'bioformats2raw' java program
         run_commandline(f"bioformats2raw --overwrite --resolutions {series_metadata['Resolutions']} --tile-width {patch_size} --max-workers {max_workers} --series {vsi_series} {vsi_path} {raw_folder}", verbose=1, print_command=True)
     else:
         print(f'\nExisting raw folder found at {raw_folder}, skipping extraction (select overwrite=True to overwrite existing folder)')
-    
-    # Update the zarr folder after performing the background subtraction method
-    save_modified_zarr_pyramid(raw_folder, zarr_level=zarr_level, methods=methods, load_into_memory=load_into_memory)
-    
-    # Covert zarr-comptaible folder using 'raw2ometiff' java program back into
+
+    save_modified_zarr_pyramid(raw_folder, zarr_level=zarr_level, methods=methods, load_into_memory=load_into_memory, axis_order=axis_order)
+
     run_commandline(f"raw2ometiff {raw_folder} {output_ometiff}", verbose=1, print_command=True)
 
 
