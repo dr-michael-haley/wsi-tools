@@ -128,7 +128,7 @@ def parse_showinf_series_metadata(log_lines, series_number):
 
     return series_info
     
-def vsi_folder_to_zarr(raw_folder = "Images_raw",
+def vsi_folder_to_zarr_UNUSED(raw_folder = "Images_raw",
                                 tile_size = 512,
                                 dtype = np.uint16,
                                 series = 1,
@@ -255,6 +255,7 @@ def subtract_background(array, methods, verbose=True):
 
 def napari_tile_inspector(zarr_path,
                           chunk_size=(1024,1024),
+                          channel_order = 'TCZYX',
                           channel_names=None,
                           channel_colors=None,
                           zarr_level="0",
@@ -271,12 +272,45 @@ def napari_tile_inspector(zarr_path,
     # Load to dask from on disk zarr
     store = zarr.open(zarr_path, mode='r')[zarr_level]
     original_dask = da.from_zarr(store[display_level])
-    
-    C = original_dask.shape[1]
-    Y = original_dask.shape[3]
-    X = original_dask.shape[4]
-    ch_names = channel_names or [f"Ch{i+1}" for i in range(C)]
-    ch_colors = channel_colors or ["gray"]*C
+
+    # Extract indices of different components of data (time, channels, z, y, x)
+    T, C, Z, Y, X = [channel_order.index(x) for x in "TCZYX"]
+
+    # Read in metadata
+    with open(os.path.join(zarr_path, "OME", "METADATA.ome.xml"), encoding='utf-8') as f:
+        xml_text = f.read()
+
+    # Fix bad characters
+    xml_text = xml_text.replace("Âµm", "µm")
+
+    # Parse with ome-types
+    ome = from_xml(xml_text)
+
+    # Extract channels
+    channels = ome.images[0].pixels.channels
+
+    # List of channel names
+    if not channel_names:
+        channel_names = [ch.name for ch in channels]
+
+    # Helper: map emission wavelength to a rough color name
+    def wavelength_to_color(wavelength_nm):
+        if wavelength_nm < 500:
+            return 'blue'
+        elif 500 <= wavelength_nm < 570:
+            return 'green'
+        elif 570 <= wavelength_nm < 590:
+            return 'yellow'
+        elif 590 <= wavelength_nm < 620:
+            return 'orange'
+        elif 620 <= wavelength_nm < 750:
+            return 'red'
+        else:
+            return 'gray'  # fallback for IR/UV or unknown
+
+    # List of colors for napari visualization
+    if not channel_colors:
+        channel_colors = [wavelength_to_color(ch.emission_wavelength) for ch in channels]
 
     viewer = napari.Viewer()
     raw_layers = []
@@ -284,11 +318,11 @@ def napari_tile_inspector(zarr_path,
     contrast_limits = []
 
     # Add raw placeholders
-    for c,name in enumerate(ch_names):
+    for c,name in enumerate(channel_names):
         layer = viewer.add_image(
             np.zeros(chunk_size),
             name=f"Original - {name}",
-            colormap=ch_colors[c],
+            colormap=channel_colors[c],
             blending='additive'
         )
         raw_layers.append(layer)
@@ -361,7 +395,7 @@ def napari_tile_inspector(zarr_path,
     )
     def apply_bg(method:str, sigma_px:int, size_px:int, rescale:bool, threshold:int):
         try:
-            for c,name in enumerate(ch_names):
+            for c,name in enumerate(channel_names):
                 tile = raw_layers[c].data
                 if tile is None: continue
                 arr = tile[None,...]
@@ -393,7 +427,7 @@ def napari_tile_inspector(zarr_path,
                             show_error(str(e))
                     return _add
 
-                QTimer.singleShot(0, make_do_add(corrected, nm, ch_colors[c], cl))
+                QTimer.singleShot(0, make_do_add(corrected, nm, channel_colors[c], cl))
                 
             show_info("Applied "+method)
         except Exception as e:
@@ -603,69 +637,6 @@ def build_pyramid_numpy(base, num_levels):
         pyramid.append(base)
     return pyramid
 
-
-def process_saved_regions_UNUUSED(zarr_path, region_dir, zarr_level="0", pyramid_levels=4):
-    """
-    Crop saved regions from a BioFormats2Raw-style OME-Zarr store and save each as new OME-Zarr.
-    """
-
-    # Parse the root of the OME-Zarr
-    url = parse_url(zarr_path, mode="r")
-
-    # Pass the store to Reader
-    reader = Reader(url)
-    nodes = list(reader())
-
-    # Try to access the zarr_level (e.g., '0')
-    try:
-        node = [n for n in nodes if n.name == zarr_level][0]
-    except IndexError:
-        raise ValueError(f"Zarr level '{zarr_level}' not found in {zarr_path}")
-
-    data = node.data[0]  # First multiscale
-    full_level0 = data[0]  # Highest resolution
-    full_level0 = da.from_array(full_level0)
-
-    dtype = np.uint16
-    chunking = full_level0.chunks
-    print(f"📦 Base shape: {full_level0.shape}, chunks: {chunking}")
-
-    # Extract metadata
-    axes = node.multiscales[0].axes
-    transforms = [ds.coordinate_transformations for ds in node.multiscales[0].datasets]
-    omero_channels = getattr(node, "omero", {}).get("channels", [])
-    channel_names = [c.get("label", f"Channel {i}") for i, c in enumerate(omero_channels)]
-
-    # Load region descriptions
-    region_files = [f for f in os.listdir(region_dir) if f.endswith(".json")]
-    print(f"🔍 Found {len(region_files)} region files.")
-
-    for f in region_files:
-        region_path = os.path.join(region_dir, f)
-        with open(region_path) as jf:
-            region = json.load(jf)
-
-        x, y, w, h = region["x"]
-        region_id = os.path.splitext(f)[0]
-        out_path = os.path.join(region_dir, f"{region_id}.zarr")
-
-        print(f"✂️ Cropping {region_id}: x={x}, y={y}, w={w}, h={h}")
-        crop = full_level0[:, :, :, y:y + h, x:x + w].compute().astype(dtype)
-        pyramid = build_pyramid_numpy(crop, pyramid_levels)
-
-        # Write with ome-zarr
-        out_store = parse_url(out_path, mode="w").store
-        write_multiscale(
-            pyramid,
-            store=out_store,
-            axes=axes,
-            coordinate_transformations=transforms[:pyramid_levels],
-            metadata={"name": region_id, "channels": [{"name": name} for name in channel_names]},
-        )
-
-        print(f"💾 Saved {region_id} to {out_path}")
-
-    print("✅ Done processing all regions.")
 
 import os
 import json
