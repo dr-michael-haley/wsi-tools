@@ -1,0 +1,11 @@
+numpy
+dask[array]
+scikit-image
+ome-types
+zarr
+dask-image
+scipy
+napari
+magicgui
+qtpy
+distributed

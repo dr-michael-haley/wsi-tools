@@ -1,0 +1,10 @@
+LICENSE
+README.md
+setup.py
+wsi-tools/__init__.py
+wsi-tools/wsitools.py
+wsi_tools.egg-info/PKG-INFO
+wsi_tools.egg-info/SOURCES.txt
+wsi_tools.egg-info/dependency_links.txt
+wsi_tools.egg-info/requires.txt
+wsi_tools.egg-info/top_level.txt

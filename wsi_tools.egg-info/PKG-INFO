@@ -1,0 +1,25 @@
+Metadata-Version: 2.4
+Name: wsi-tools
+Version: 0.1
+Summary: Tools for analysing whole slide imaging datasets
+Home-page: https://github.com/dr-michael-haley/wsi-tools
+Author: Michael Haley
+Author-email: mrmichaelhaley@gmail.com
+License-File: LICENSE
+Requires-Dist: numpy
+Requires-Dist: dask[array]
+Requires-Dist: scikit-image
+Requires-Dist: ome-types
+Requires-Dist: zarr
+Requires-Dist: dask-image
+Requires-Dist: scipy
+Requires-Dist: napari
+Requires-Dist: magicgui
+Requires-Dist: qtpy
+Requires-Dist: distributed
+Dynamic: author
+Dynamic: author-email
+Dynamic: home-page
+Dynamic: license-file
+Dynamic: requires-dist
+Dynamic: summary
