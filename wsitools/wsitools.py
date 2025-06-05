@@ -1,6 +1,7 @@
 import logging
 import os
 import re
+from glob import glob
 import subprocess as sp
 import numpy as np
 import dask.array as da
@@ -607,6 +608,59 @@ def vsi_background_subtract(vsi_path,
     run_commandline(f"raw2ometiff {raw_folder} {output_ometiff}", verbose=1, print_command=True)
 
 
+def vsi_to_zarr_batch(vsi_files_path,
+                      output_path,
+                      vsi_series=2,
+                      patch_size=None,
+                      max_workers=8,
+                      overwrite=True):
+    """
+    Converts all .vsi files in a folder to zarr using bioformats2raw.
+    Each .vsi file gets its own subfolder inside output_path.
+    """
+    vsi_files = glob(os.path.join(vsi_files_path, "*.vsi"))
+    if not vsi_files:
+        print(f"No .vsi files found in {vsi_files_path}")
+        return
+
+    print(f'{len(vsi_files)} .vsi files found in {str(vsi_files_path)}')
+
+    os.makedirs(output_path, exist_ok=True)
+
+    for vsi_path in vsi_files:
+        base_name = os.path.splitext(os.path.basename(vsi_path))[0]
+        raw_folder = os.path.join(output_path, base_name)
+
+        print(f"\nProcessing {vsi_path} → {raw_folder}")
+
+        # Get metadata
+        print(f"Reading metadata for series {vsi_series} using showinf...")
+        showinf_readout = run_commandline(
+            f"showinf -nopix -noflat -series {vsi_series} {vsi_path}",
+            verbose=1,
+            return_readout=True
+        )
+        series_metadata = parse_showinf_series_metadata(showinf_readout, series_number=vsi_series)
+
+        if not os.path.isdir(raw_folder) or overwrite:
+            print(f"\nConverting {vsi_path} to Zarr folder...")
+            run_commandline(
+                f"bioformats2raw --overwrite --resolutions {series_metadata['Resolutions']} "
+                f"--tile-width {patch_size} --max-workers {max_workers} "
+                f"--series {vsi_series} {vsi_path} {raw_folder}",
+                verbose=1,
+                print_command=True
+            )
+        else:
+            print(f"Zarr folder already exists at {raw_folder}; skipping (set overwrite=True to force)")
+
+
+
+
+
+
+
+
 # Generate the complete region crop tool for WSI using napari + zarr + dask
 # This includes:
 # 1. Napari viewer for annotation on low-res pyramid
@@ -671,8 +725,6 @@ def launch_annotation_viewer(zarr_path, output_root, zarr_level="0", display_lev
     viewer.window.add_dock_widget(save_shapes, area='right')
     print(f"✅ Annotation viewer launched for {zarr_path}, saving to {output_root}")
     return viewer
-
-import json
 
 def save_annotation_shapes(shapes_data, output_root, display_level=3):
     """
@@ -831,6 +883,7 @@ def process_saved_regions(zarr_path, region_dir, zarr_level="0", pyramid_levels=
     zarr_store = zarr.open(zarr_path, mode='r')
     level0 = zarr_store[zarr_level]["0"]
     fullres = da.from_zarr(level0)
+    print(fullres)
     original_chunks = level0.chunks
     dtype = fullres.dtype
 
