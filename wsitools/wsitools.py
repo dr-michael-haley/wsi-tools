@@ -1,10 +1,12 @@
 import logging
 import os
 import re
+from pathlib import Path
 from glob import glob
 import subprocess as sp
 import numpy as np
 import dask.array as da
+from dask.array import Array as DaskArray
 from skimage.transform import downscale_local_mean
 from ome_types import from_xml
 import subprocess
@@ -18,6 +20,7 @@ import numpy as np
 
 import napari
 import numpy as np
+import pandas as pd
 import dask.array as da
 import random
 from magicgui import magicgui, widgets
@@ -264,7 +267,34 @@ def subtract_background(array, methods, axis_order='CYX', verbose=True):
     return result
 
 
+# Helper: map emission wavelength to a rough color name
+def wavelength_to_color(wavelength_nm):
+    if wavelength_nm < 500:
+        return 'blue'
+    elif 500 <= wavelength_nm < 550:
+        return 'green'
+    elif 550 <= wavelength_nm < 590:
+        return 'orange'
+    elif 590 <= wavelength_nm < 750:
+        return 'red'
+    else:
+        return 'gray'  # fallback for IR/UV or unknown
 
+def wavelength_to_color2(wavelength_nm):
+    """
+    Convert wavelength (nm) to an approximate RGB color.
+    Based on: https://stackoverflow.com/a/16854885
+    """
+    import matplotlib.colors as mcolors
+    import matplotlib.pyplot as plt
+
+    # Use matplotlib's colormap as fallback
+    try:
+        cmap = plt.get_cmap('nipy_spectral')
+        norm = plt.Normalize(400, 700)
+        return cmap(norm(wavelength_nm))[:3]  # return RGB tuple
+    except Exception:
+        return (1.0, 1.0, 1.0)  # white fallback
 
 
 def napari_tile_inspector(zarr_path,
@@ -312,19 +342,6 @@ def napari_tile_inspector(zarr_path,
     # List of channel names
     if not channel_names:
         channel_names = [ch.name for ch in channels]
-
-    # Helper: map emission wavelength to a rough color name
-    def wavelength_to_color(wavelength_nm):
-        if wavelength_nm < 500:
-            return 'blue'
-        elif 500 <= wavelength_nm < 550:
-            return 'green'
-        elif 550 <= wavelength_nm < 590:
-            return 'orange'
-        elif 590 <= wavelength_nm < 750:
-            return 'red'
-        else:
-            return 'gray'  # fallback for IR/UV or unknown
 
     # List of colors for napari visualization
     if not channel_colors:
@@ -611,7 +628,7 @@ def vsi_background_subtract(vsi_path,
 def vsi_to_zarr_batch(vsi_files_path,
                       output_path,
                       vsi_series=2,
-                      patch_size=None,
+                      patch_size=1024,
                       max_workers=8,
                       overwrite=True):
     """
@@ -700,54 +717,254 @@ def update_multiscale_metadata(zarr_group, num_levels, axes=None):
 # Function 1: Launch Viewer
 # ------------------------------
 
-def launch_annotation_viewer(zarr_path, output_root, zarr_level="0", display_level=6):
-    """
-    Launch Napari for region annotation on a WSI and crop regions into new Zarr pyramids.
+import os
+import json
+import zarr
+import dask.array as da
+import numpy as np
+import napari
+from magicgui import magicgui
 
-    Parameters:
-    - zarr_path (str): path to top-level Zarr (e.g. "Images_raw")
-    - output_root (str): folder to save cropped region Zarrs into
-    - zarr_level (str): subfolder of Zarr with pyramid arrays (default: "0")
-    - display_level (int): which downsample level to display for annotation (default: 3)
-    - pyramid_levels (int): how many pyramid levels to build per cropped region
-    """
-    store = zarr.open(zarr_path, mode='r')[zarr_level]
-    lowres = da.from_zarr(store[str(display_level)])
+def list_zarr_folders(zarr_path):
+    return sorted([
+        name for name in os.listdir(zarr_path)
+        if os.path.isdir(os.path.join(zarr_path, name))
+    ])
 
+def load_saved_shapes(json_folder, scale):
+    shapes = []
+    for fname in sorted(os.listdir(json_folder)):
+        if fname.endswith('.json'):
+            with open(os.path.join(json_folder, fname), 'r') as f:
+                region = json.load(f)
+                ymin = region['ymin']
+                ymax = region['ymax']
+                xmin = region['xmin']
+                xmax = region['xmax']
+                shape = np.array([
+                    [ymin, xmin],
+                    [ymin, xmax],
+                    [ymax, xmax],
+                    [ymax, xmin]
+                ]) / scale  # ✅ Downscale for display
+                shapes.append(shape)
+    return np.array(shapes)
+
+def launch_annotation_viewer(zarr_path_root, output_root, zarr_level="0", axis_order = 'TCZYX',):
+    zarr_folders = list_zarr_folders(zarr_path_root)
     viewer = napari.Viewer()
-    viewer.add_image(lowres, name="WSI LowRes", colormap='gray')
-    shapes = viewer.add_shapes(name="Regions", shape_type='rectangle', edge_color='red', face_color='transparent')
 
-    @magicgui(call_button="Save Region Shapes")
-    def save_shapes():
-        save_annotation_shapes(shapes.data, output_root=output_root, display_level=display_level)
+    def load_zarr_folder(zarr_folder_name, load_regions=True, normalize_contrast=True, normalization_percentile=0.99, display_level=6):
 
+        viewer.layers.clear()
+        full_zarr_path = os.path.join(zarr_path_root, zarr_folder_name)
+        store = zarr.open(full_zarr_path, mode='r')[zarr_level]
+        lowres = da.from_zarr(store[str(display_level)])
+
+        scale = 2 ** display_level
+        output_path = os.path.join(output_root, zarr_folder_name)
+
+        # Extract channel names and colors from OME
+        try:
+            with open(os.path.join(full_zarr_path, "OME", "METADATA.ome.xml"), encoding='utf-8') as f:
+                xml_text = f.read()
+            xml_text = xml_text.replace("Âµm", "µm")
+
+            from ome_types import from_xml
+            ome = from_xml(xml_text)
+            channels = ome.images[0].pixels.channels
+
+            channel_names = [ch.name for ch in channels]
+            channel_colors = [wavelength_to_color(ch.emission_wavelength) if ch.emission_wavelength else (1.0, 1.0, 1.0)
+                              for ch in channels]
+
+        except Exception as e:
+            print(f"⚠️ Failed to read OME metadata: {e}")
+            try:
+                channel_axis = axis_order.index('C')
+                num_channels = lowres.shape[channel_axis]
+            except ValueError:
+                print("❌ 'C' not found in axis_order.")
+                num_channels = 1
+
+            channel_names = [f"Channel {i}" for i in range(num_channels)]
+            channel_colors = [(1.0, 1.0, 1.0)] * num_channels
+
+        # Determine channel axis and move to front
+        try:
+            channel_axis = axis_order.index('C')
+            num_channels = lowres.shape[channel_axis]
+            lowres_channels_first = da.moveaxis(lowres, channel_axis, 0)
+
+        except Exception as e:
+            print(f"❌ Error moving channel axis: {e}")
+            viewer.add_image(
+                lowres,
+                name="Image",
+                colormap='gray',
+                scale=(scale, scale)
+            )
+            num_channels = 1
+            lowres_channels_first = [lowres]
+
+        # Add each channel as its own image layer with normalization
+        for i in range(num_channels):
+            # 1. Squeeze and prepare channel image
+            channel_img = da.squeeze(lowres_channels_first[i])
+
+            # 2. Add image layer first
+            image_layer = viewer.add_image(
+                channel_img,
+                name=channel_names[i] if i < len(channel_names) else f"Channel {i}",
+                colormap=channel_colors[i],
+                scale=(scale, scale),
+                blending="additive"
+            )
+
+            # 3. Optionally normalize contrast
+            if normalize_contrast:
+                try:
+                    if isinstance(image_layer.data, DaskArray):
+                        data = image_layer.data.compute()
+                    else:
+                        data = np.asarray(image_layer.data)
+
+                    vmin = float(np.percentile(data, 0))
+                    vmax = float(np.percentile(data, normalization_percentile * 100))
+
+                    image_layer.contrast_limits = (vmin, vmax)
+                except Exception as e:
+                    print(f"⚠️ Could not compute contrast for channel {i}: {e}")
+
+        # Load and add shapes
+        if load_regions and os.path.isdir(output_path):
+            shapes = load_saved_shapes(output_path, scale)
+        else:
+            shapes = []
+
+        if "Regions" in viewer.layers:
+            viewer.layers.remove("Regions")
+
+        new_shapes_layer = viewer.add_shapes(
+            data=shapes,
+            name="Regions",
+            shape_type="rectangle",
+            edge_color="red",
+            edge_width=10,
+            face_color="transparent",
+            scale=(scale, scale)
+        )
+
+        save_shapes.current_layer = new_shapes_layer
+        save_shapes.zarr_folder_name = zarr_folder_name
+        save_shapes.scale = scale
+
+        print(f"✅ Loaded Zarr: {zarr_folder_name} with {'regions' if load_regions else 'no regions'}")
+
+    @magicgui(
+        zarr_folder={"choices": zarr_folders},
+        load_saved_regions={"label": "Load saved regions"},
+        normalize_contrast={"label": "Normalize contrast"},
+        normalization_percentile={"widget_type": "FloatSpinBox", "min": 0.0, "max": 1.0, "step": 0.01,
+                                  "label": "Normalize to percentile"},
+        display_level={"widget_type": "SpinBox", "min": 0, "max": 10, "step": 1, "label": "Display level"},
+        call_button="Load Zarr"
+    )
+    def select_zarr(zarr_folder, load_saved_regions=True, normalize_contrast=True, normalization_percentile=0.99,
+                    display_level=6):
+        load_zarr_folder(
+            zarr_folder,
+            load_regions=load_saved_regions,
+            normalize_contrast=normalize_contrast,
+            normalization_percentile=normalization_percentile,
+            display_level=display_level
+        )
+
+    @magicgui(
+        overwrite={"label": "Overwrite saved regions"},
+        call_button="Save Region Shapes"
+    )
+    def save_shapes(overwrite: bool = True):
+        output_path = os.path.join(output_root, save_shapes.zarr_folder_name)
+        display_level = select_zarr.display_level.value
+        save_annotation_shapes(
+            save_shapes.current_layer.data,
+            output_root=output_path,
+            display_level=display_level,
+            overwrite=overwrite
+        )
+    @magicgui(call_button="Clear Regions")
+    def clear_shapes():
+        if hasattr(save_shapes, "current_layer") and save_shapes.current_layer in viewer.layers:
+            save_shapes.current_layer.data = []
+            print("🧹 Cleared all shapes from the viewer.")
+        else:
+            print("⚠️ No shapes layer found.")
+
+    viewer.window.add_dock_widget(select_zarr, area='right')
     viewer.window.add_dock_widget(save_shapes, area='right')
-    print(f"✅ Annotation viewer launched for {zarr_path}, saving to {output_root}")
+    viewer.window.add_dock_widget(clear_shapes, area='right')
+
+    if zarr_folders:
+        load_zarr_folder(zarr_folders[0], load_regions=True)
+
+    @magicgui(call_button="Clear Regions")
+    def clear_shapes():
+        if hasattr(save_shapes, "current_layer") and save_shapes.current_layer in viewer.layers:
+            save_shapes.current_layer.data = []
+            print("🧹 Cleared all shapes from the viewer.")
+        else:
+            print("⚠️ No shapes layer found.")
+
+
+
+    print(f"✅ Annotation viewer initialized for root: {zarr_path_root}")
     return viewer
 
-def save_annotation_shapes(shapes_data, output_root, display_level=3):
-    """
-    Save napari shape rectangles to JSON files scaled to level 0.
 
-    Parameters:
-    - shapes_data: List of (N, 4, 2) arrays from napari shapes
-    - output_root: Folder to write region_###.json files into
-    - display_level: downsample level (e.g. 3 → scale=8)
-    """
+
+def save_annotation_shapes(shapes_data, output_root, display_level=3, overwrite=True):
     os.makedirs(output_root, exist_ok=True)
     scale = 2 ** display_level
 
+    current_files = []
     for i, shape in enumerate(shapes_data):
         coords = (np.array(shape) * scale).astype(int)
         ymin, xmin = np.min(coords, axis=0).tolist()
         ymax, xmax = np.max(coords, axis=0).tolist()
 
-        region_data = {"index": i+1, "ymin": ymin, "ymax": ymax, "xmin": xmin, "xmax": xmax}
-        with open(os.path.join(output_root, f"region_{i+1:03d}.json"), "w") as f:
+        region_data = {
+            "index": i + 1,
+            "ymin": ymin,
+            "ymax": ymax,
+            "xmin": xmin,
+            "xmax": xmax
+        }
+
+        json_filename = f"region_{i+1:03d}.json"
+        json_path = os.path.join(output_root, json_filename)
+        current_files.append(json_filename)
+
+        if not overwrite and os.path.exists(json_path):
+            print(f"⚠️  Skipping existing file: {json_path}")
+            continue
+
+        with open(json_path, "w") as f:
             json.dump(region_data, f)
 
+    # Delete any old region JSONs not in the current set
+    existing_files = [f for f in os.listdir(output_root) if f.endswith(".json")]
+    stale_files = set(existing_files) - set(current_files)
+
+    for stale in stale_files:
+        stale_path = os.path.join(output_root, stale)
+        os.remove(stale_path)
+        print(f"🗑️ Removed stale region: {stale_path}")
+
     print(f"✅ Saved {len(shapes_data)} region JSONs to: {output_root}")
+
+
+
 
 def build_pyramid_numpy(base, num_levels):
     pyramid = [base]
@@ -868,60 +1085,202 @@ def update_ome_xml_dimensions(region_path, shape, dtype="uint16"):
     print(f"📄 Updated OME-XML dimensions in: {xml_path}")
 
 
-def process_saved_regions(zarr_path, region_dir, zarr_level="0", pyramid_levels=None):
+def process_all_zarrs_and_regions(
+    zarr_path_root,
+    regions_root,
+    zarr_crops_path="zarr_crops",
+    ometiffs_path="ometiffs",
+    convert_to_ome_tiff=True,
+    flatten_ometiff_folder=True,
+    delete_zarr_crops_after=True,
+    zarr_level="0",
+    dtype='uint16',
+    pyramid_levels=None,
+    rename_files=False
+):
+    os.makedirs(zarr_crops_path, exist_ok=True)
+    if convert_to_ome_tiff:
+        os.makedirs(ometiffs_path, exist_ok=True)
+
+    zarr_folders = sorted([
+        f for f in os.listdir(zarr_path_root)
+        if os.path.isdir(os.path.join(zarr_path_root, f))
+    ])
+
+    # Load or generate rename map
+    rename_map = {}
+    if rename_files:
+        rename_csv = "vsi_rename.csv"
+        if not os.path.exists(rename_csv):
+            df = pd.DataFrame(index=zarr_folders)
+            df["rename"] = ""
+            df.to_csv(rename_csv)
+            print(f"⚠️ Created template {rename_csv}. Please fill it and re-run.")
+            return
+
+        df = pd.read_csv(rename_csv, index_col=0)
+        missing = [zf for zf in zarr_folders if zf not in df.index or not isinstance(df.loc[zf, 'rename'], str) or df.loc[zf, 'rename'].strip() == ""]
+        if missing:
+            print(f"⚠️ Rename entries missing for: {missing}")
+            print(f"Please update {rename_csv} and re-run.")
+            return
+
+        rename_map = df["rename"].to_dict()
+
+    for zarr_name in zarr_folders:
+        zarr_path = os.path.join(zarr_path_root, zarr_name)
+        region_dir = os.path.join(regions_root, zarr_name)
+        if not os.path.isdir(region_dir):
+            print(f"⚠️ No region folder for {zarr_name}, skipping.")
+            continue
+
+        print(f"\n🚀 Processing Zarr: {zarr_name}")
+        region_files = sorted(glob(os.path.join(region_dir, "*.json")))
+        if not region_files:
+            print("⚠️ No regions found.")
+            continue
+
+        # Load Zarr
+        zarr_store = zarr.open(zarr_path, mode='r')
+        level0 = zarr_store[zarr_level]["0"]
+        fullres = da.from_zarr(level0)
+        original_chunks = level0.chunks
+        if not dtype: dtype = fullres.dtype
+
+        if pyramid_levels is None:
+            pyramid_levels = len(list(zarr_store[zarr_level].array_keys())) + 1
+
+        base_name = rename_map.get(zarr_name, zarr_name)
+
+        for region_file in region_files:
+            region_id = Path(region_file).stem
+            with open(region_file, "r") as f:
+                region_info = json.load(f)
+
+            ymin = region_info["ymin"]
+            ymax = region_info["ymax"]
+            xmin = region_info["xmin"]
+            xmax = region_info["xmax"]
+
+            print(f"✂️  Cropping {zarr_name} — {region_id} → Y: {ymin}-{ymax}, X: {xmin}-{xmax}")
+
+            cropped = fullres[:, :, :, ymin:ymax, xmin:xmax].compute()
+            pyramid = build_pyramid_numpy(cropped, num_levels=pyramid_levels)
+
+            out_crop_name = f"{base_name}_{region_id}"
+            out_crop_path = os.path.join(zarr_crops_path, out_crop_name)
+
+            save_region_pyramid(
+                pyramid,
+                out_crop_path,
+                zarr_level=zarr_level,
+                chunks=original_chunks,
+                dtype=dtype
+            )
+
+            copy_metadata_structure(zarr_path, out_crop_path, zarr_level=zarr_level)
+            update_ome_xml_dimensions(out_crop_path, shape=cropped.shape, dtype=str(dtype))
+
+            print(f"✅ Saved crop: {out_crop_path}")
+
+            # Convert to OME-TIFF
+            if convert_to_ome_tiff:
+                if flatten_ometiff_folder:
+                    tiff_path = os.path.join(ometiffs_path, f"{out_crop_name}.ome.tiff")
+                else:
+                    subfolder = os.path.join(ometiffs_path, base_name)
+                    os.makedirs(subfolder, exist_ok=True)
+                    tiff_path = os.path.join(subfolder, f"{region_id}.ome.tiff")
+
+                command = f"raw2ometiff {out_crop_path} {tiff_path}"
+                run_commandline(command, verbose=0, print_command=True)
+
+        print(f"✅ Finished processing: {zarr_name}")
+
+    if convert_to_ome_tiff and delete_zarr_crops_after:
+        print(f"🧹 Deleting temporary crops in: {zarr_crops_path}")
+        shutil.rmtree(zarr_crops_path)
+
+import os
+import shutil
+import pandas as pd
+from pathlib import Path
+
+def organize_ometiffs(ometiffs_path="ometiffs", reverse=False):
     """
-    Process all saved region definitions and save as separate Zarr pyramids.
+    Organizes or reverses organization of OME-TIFFs in a given folder using a CSV.
 
     Parameters:
-    - zarr_path: original BioFormats2Raw-style Zarr folder.
-    - region_dir: folder with JSON files for region definitions.
-    - zarr_level: typically "0" — the main group holding pyramids.
-    - pyramid_levels: how many pyramid levels to generate (match original if None).
+    - ometiffs_path (str): Root directory containing .ome.tiff files or subfolders.
+    - reverse (bool): If True, flattens any subfolders and moves files back to root.
     """
 
-    # Load full-resolution Zarr array
-    zarr_store = zarr.open(zarr_path, mode='r')
-    level0 = zarr_store[zarr_level]["0"]
-    fullres = da.from_zarr(level0)
-    print(fullres)
-    original_chunks = level0.chunks
-    dtype = fullres.dtype
+    ometiffs_path = Path(ometiffs_path)
 
-    if pyramid_levels is None:
-        pyramid_levels = len(list(zarr_store[zarr_level].array_keys())) + 1
+    if reverse:
+        print("🔁 Reversing subfolder organization...")
 
-    print(f"🔍 Found {pyramid_levels} pyramid levels with chunk size {original_chunks}")
+        ome_files = list(ometiffs_path.glob("**/*.ome.tiff"))
+        ome_files = [f for f in ome_files if f.parent != ometiffs_path]
 
-    # Find region definition files
-    region_files = sorted(glob(os.path.join(region_dir, "*.json")))
-    print(f"🔍 Found {len(region_files)} region files.")
+        if not ome_files:
+            print("⚠️ No .ome.tiff files found in subfolders to reverse.")
+            return
 
-    for region_file in region_files:
-        region_id = os.path.splitext(os.path.basename(region_file))[0]
-        with open(region_file, "r") as f:
-            region_info = json.load(f)
+        for f in ome_files:
+            target = ometiffs_path / f.name
+            if target.exists():
+                print(f"⚠️ File already exists at root: {target.name}, skipping.")
+                continue
+            shutil.move(str(f), str(target))
 
-        ymin = region_info["ymin"]
-        ymax = region_info["ymax"]
-        xmin = region_info["xmin"]
-        xmax = region_info["xmax"]
+        # Clean up empty subfolders
+        for subdir in ometiffs_path.glob("*/"):
+            if subdir.is_dir() and not any(subdir.iterdir()):
+                subdir.rmdir()
+                print(f"🧹 Removed empty folder: {subdir}")
 
-        print(f"✂️ Cropping region: {region_id} → Y: {ymin}-{ymax}, X: {xmin}-{xmax}")
+        print("✅ All .ome.tiff files moved back to root.")
+        return
 
-        cropped = fullres[:, :, :, ymin:ymax, xmin:xmax].compute()
-        pyramid = build_pyramid_numpy(cropped, num_levels=pyramid_levels)
+    # --- Normal mode (organize into subfolders) ---
+    # Check if any ome.tiffs are already inside subfolders
+    already_nested = any(f.is_file() and f.parent != ometiffs_path for f in ometiffs_path.glob("**/*.ome.tiff"))
+    if already_nested:
+        print("⚠️ Some .ome.tiff files already exist in subfolders. Use reverse=True to undo.")
+        return
 
-        out_path = os.path.join(region_dir, region_id)
-        save_region_pyramid(
-            pyramid,
-            out_path,
-            zarr_level=zarr_level,
-            chunks=original_chunks,
-            dtype=dtype
-        )
+    csv_path = Path("organise_ometiffs.csv")
+    ome_files = sorted([f.name for f in ometiffs_path.glob("*.ome.tiff")])
 
-        copy_metadata_structure(zarr_path, out_path, zarr_level=zarr_level)
-        update_ome_xml_dimensions(region_path=out_path, shape=cropped.shape)
+    if not csv_path.exists():
+        df = pd.DataFrame(index=ome_files)
+        df["subfolder"] = ""
+        df.to_csv(csv_path)
+        print(f"⚠️ Created template CSV: {csv_path}. Please complete and re-run.")
+        return
 
-        print(f"✅ Saved region to: {out_path}")
+    df = pd.read_csv(csv_path, index_col=0)
+
+    missing = [f for f in ome_files if f not in df.index or not isinstance(df.loc[f, 'subfolder'], str) or df.loc[f, 'subfolder'].strip() == ""]
+    if missing:
+        print(f"⚠️ Missing or incomplete subfolder assignments for: {missing}")
+        print(f"Please update {csv_path} and re-run.")
+        return
+
+    # Perform the move operations
+    for file_name, subfolder in df["subfolder"].items():
+        src = ometiffs_path / file_name
+        dst_folder = ometiffs_path / subfolder
+        dst_folder.mkdir(parents=True, exist_ok=True)
+        dst = dst_folder / file_name
+
+        if not src.exists():
+            print(f"⚠️ Source file not found: {file_name}")
+            continue
+
+        shutil.move(str(src), str(dst))
+        print(f"📁 Moved {file_name} → {subfolder}/")
+
+    print("✅ OME-TIFFs organized into subfolders.")
 
