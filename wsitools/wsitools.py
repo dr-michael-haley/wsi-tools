@@ -1,35 +1,85 @@
+# --- Standard Library ---
+import json
 import logging
 import os
+import random
 import re
-from pathlib import Path
-from glob import glob
+import shutil
 import subprocess as sp
-import numpy as np
+from collections import defaultdict
+from glob import glob
+from pathlib import Path
+
+# --- Third-party Packages ---
 import dask.array as da
 from dask.array import Array as DaskArray
-from skimage.transform import downscale_local_mean
-from ome_types import from_xml
-import subprocess
-import zarr
+from dask.distributed import Client, LocalCluster
 from dask_image.ndfilters import gaussian_filter, median_filter
-from scipy.ndimage import grey_opening
-from scipy import ndimage
-from skimage.exposure import rescale_intensity, equalize_adapthist
-from skimage.transform import downscale_local_mean
-import numpy as np
+
+import matplotlib.colors as mcolors
+import matplotlib.pyplot as plt
 
 import napari
+from napari.utils.notifications import show_info, show_warning, show_error
+
 import numpy as np
 import pandas as pd
-import dask.array as da
-import random
-from magicgui import magicgui, widgets
-from skimage.io import imsave
-from napari.utils.notifications import show_info, show_warning, show_error
-from qtpy.QtCore import QTimer
-from collections import defaultdict
 
-from dask.distributed import Client, LocalCluster
+from magicgui import magicgui, widgets
+
+from ome_types import from_xml
+from ome_types.model import OME, Image, Pixels, Channel, TiffData
+
+from qtpy.QtCore import QTimer
+from qtpy.QtWidgets import QMessageBox
+
+from scipy import ndimage
+from scipy.ndimage import grey_opening
+
+from skimage.exposure import rescale_intensity, equalize_adapthist
+from skimage.io import imsave
+from skimage.morphology import opening as grey_opening
+from skimage.transform import downscale_local_mean
+
+import zarr
+
+def add_java_paths(java_paths=None):
+    """Add Java-related tool paths to environment and report status."""
+
+    # Increase Java heap memory
+    os.environ['JAVA_TOOL_OPTIONS'] = '-Xmx128G'
+
+    # Default paths
+    if not java_paths:
+        java_paths = [
+            r"C:/java_packages/bftools",
+            r"C:/java_packages/bioformats2raw-0.10.0-rc2/bin",
+            r"C:/java_packages/raw2ometiff-0.8.0-rc1/bin",
+            r"C:/java_packages/maven-mvnd-1.0.2-windows-amd64/bin",
+            r"C:/java_packages/vips-dev-8.16/bin"
+        ]
+
+    print("🔧 Adding Java tool paths to environment:")
+
+    for path in java_paths:
+        path = Path(path)
+        norm_path = str(path)
+
+        # Check existence and warn if missing
+        if not path.exists():
+            print(f"  ⚠️ Warning: path does not exist — {norm_path}")
+
+        # Add to PATH if not already included
+        if norm_path not in os.environ["PATH"]:
+            os.environ["PATH"] += os.pathsep + norm_path
+
+        # Extract readable tool name
+        base_tool = path.parent.name if path.name.lower() == "bin" else path.name
+        print(f"  ✅ Imported: {base_tool}")
+
+    print("✅ Java environment updated.")
+
+
 
 def start_dask_cluster(n_workers=12, threads_per_worker=2, memory_limit='32GB'):
     cluster = LocalCluster(n_workers=n_workers, threads_per_worker=threads_per_worker, memory_limit=memory_limit)
@@ -160,7 +210,6 @@ def vsi_folder_to_zarr_UNUSED(raw_folder = "Images_raw",
     xml_text = xml_text.replace("Âµm", "µm")
 
     # Now parse with ome-types
-    from ome_types import from_xml
     ome = from_xml(xml_text)
     
     pixels = ome.images[0].pixels
@@ -178,12 +227,6 @@ def subtract_background(array, methods, axis_order='CYX', verbose=True):
           - other method-specific parameters
       - axis_order: string like 'CYX' or 'TCZYX' describing array shape.
     """
-    import numpy as np
-    import dask.array as da
-    from dask_image.ndfilters import gaussian_filter, median_filter
-    from skimage.exposure import rescale_intensity, equalize_adapthist
-    from skimage.morphology import opening as grey_opening
-    from scipy import ndimage
 
     is_dask = isinstance(array, da.Array)
     full_ndim = array.ndim
@@ -285,8 +328,7 @@ def wavelength_to_color2(wavelength_nm):
     Convert wavelength (nm) to an approximate RGB color.
     Based on: https://stackoverflow.com/a/16854885
     """
-    import matplotlib.colors as mcolors
-    import matplotlib.pyplot as plt
+
 
     # Use matplotlib's colormap as fallback
     try:
@@ -402,7 +444,6 @@ def napari_tile_inspector(zarr_path,
         """
         Sync contrast limits of all layers matching each original channel name.
         """
-        from collections import defaultdict
 
         groups = defaultdict(list)
 
@@ -552,9 +593,6 @@ def build_pyramid_numpy(base, num_levels, axis_order='TCZYX'):
 
 
 def save_modified_zarr_pyramid(zarr_path, zarr_level="0", methods=None, load_into_memory=False, axis_order="TCZYX"):
-    import dask.array as da
-    import zarr
-    import numpy as np
 
     if methods is None:
         raise ValueError("Must provide background subtraction methods.")
@@ -684,15 +722,6 @@ def vsi_to_zarr_batch(vsi_files_path,
 # 2. Cropper that slices the full-res pyramid based on user-drawn regions
 # 3. Writes full Zarr pyramids with metadata for raw2ometiff/QuPath compatibility
 
-import numpy as np
-import dask.array as da
-import zarr
-import os
-from magicgui import magicgui
-from skimage.transform import downscale_local_mean
-import napari
-from qtpy.QtWidgets import QMessageBox
-from ome_types.model import OME, Image, Pixels, Channel, TiffData
 
 # ------------------------------
 # Utility: Update .zattrs metadata
@@ -716,14 +745,6 @@ def update_multiscale_metadata(zarr_group, num_levels, axes=None):
 # ------------------------------
 # Function 1: Launch Viewer
 # ------------------------------
-
-import os
-import json
-import zarr
-import dask.array as da
-import numpy as np
-import napari
-from magicgui import magicgui
 
 def list_zarr_folders(zarr_path):
     return sorted([
@@ -974,14 +995,6 @@ def build_pyramid_numpy(base, num_levels):
     return pyramid
 
 
-import os
-import json
-import shutil
-import zarr
-import dask.array as da
-import numpy as np
-from skimage.transform import downscale_local_mean
-from glob import glob
 
 def save_region_pyramid(pyramid, out_path, zarr_level="0", chunks=None, dtype="uint16"):
     """
@@ -1201,10 +1214,7 @@ def process_all_zarrs_and_regions(
         print(f"🧹 Deleting temporary crops in: {zarr_crops_path}")
         shutil.rmtree(zarr_crops_path)
 
-import os
-import shutil
-import pandas as pd
-from pathlib import Path
+
 
 def organize_ometiffs(ometiffs_path="ometiffs", reverse=False):
     """
