@@ -771,7 +771,7 @@ def vsi_to_zarr_batch(output_path,
 
         # Filter only included files using absolute paths
         vsi_include_paths = vsi_df.loc[vsi_df.Include, 'Path'].tolist()
-        vsi_files = [x for x in vsi_files if x in vsi_include_paths]
+        vsi_files = vsi_include_paths #[x for x in vsi_files if x in vsi_include_paths]
 
     else:
         if vsi_list:
