@@ -647,17 +647,17 @@ def vsi_background_subtract(vsi_path,
                             overwrite=True,
                             patch_size=512,
                             axis_order="TCZYX"):
-    print(f"Using showinf to read metadata for {vsi_path}, series# {vsi_series}...\n")
-    showinf_readout = run_commandline(f"showinf -nopix -noflat -series {vsi_series} {vsi_path}", verbose=1, return_readout=True)
+    print(f"Using showinf to read metadata for \"{vsi_path}\", series# {vsi_series}...\n")
+    showinf_readout = run_commandline(f"showinf -nopix -noflat -series {vsi_series} \"{vsi_path}\"", verbose=1, return_readout=True)
     series_metadata = parse_showinf_series_metadata(showinf_readout, series_number=vsi_series)
 
-    print(f'Metadata for {vsi_path}, series# {vsi_series}:')
+    print(f'Metadata for \"{vsi_path}\", series# {vsi_series}:')
     for i, v in series_metadata.items():
         print(f"{i} = {v}")
 
     if not os.path.isdir(raw_folder) or overwrite:
         print('\nConverting .vsi whole slide image files into zarr folder...')
-        run_commandline(f"bioformats2raw --overwrite --resolutions {series_metadata['Resolutions']} --tile-width {patch_size} --max-workers {max_workers} --series {vsi_series} {vsi_path} {raw_folder}", verbose=1, print_command=True)
+        run_commandline(f"bioformats2raw --overwrite --resolutions {series_metadata['Resolutions']} --tile-width {patch_size} --max-workers {max_workers} --series {vsi_series} \"{vsi_path}\" {raw_folder}", verbose=1, print_command=True)
     else:
         print(f'\nExisting raw folder found at {raw_folder}, skipping extraction (select overwrite=True to overwrite existing folder)')
 
@@ -790,12 +790,12 @@ def vsi_to_zarr_batch(output_path,
                     base_name = new_name
 
         raw_folder = os.path.join(output_path, base_name)
-        print(f"\nProcessing {vsi_path} → {raw_folder}")
+        print(f"\nProcessing \"{vsi_path}\" → {raw_folder}")
 
         # Get metadata
         print(f"Reading metadata for series {vsi_series} using showinf...")
         showinf_readout = run_commandline(
-            f"showinf -nopix -noflat -series {vsi_series} {vsi_path}",
+            f"showinf -nopix -noflat -series {vsi_series} \"{vsi_path}\"",
             verbose=1,
             return_readout=True
         )
@@ -803,11 +803,11 @@ def vsi_to_zarr_batch(output_path,
 
         # Run bioformats2raw conversion
         if not os.path.isdir(raw_folder) or overwrite:
-            print(f"\nConverting {vsi_path} to Zarr folder...")
+            print(f"\nConverting \"{vsi_path}\" to Zarr folder...")
             run_commandline(
                 f"bioformats2raw --overwrite --resolutions {series_metadata['Resolutions']} "
                 f"--tile-width {patch_size} --max-workers {max_workers} "
-                f"--series {vsi_series} {vsi_path} {raw_folder}",
+                f"--series {vsi_series} \"{vsi_path}\" {raw_folder}",
                 verbose=1,
                 print_command=True
             )
