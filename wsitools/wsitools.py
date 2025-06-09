@@ -9,12 +9,15 @@ import subprocess as sp
 from collections import defaultdict
 from glob import glob
 from pathlib import Path
+from IPython.core.display import HTML
 
 # --- Third-party Packages ---
 import dask.array as da
 from dask.array import Array as DaskArray
 from dask.distributed import Client, LocalCluster
 from dask_image.ndfilters import gaussian_filter, median_filter
+
+from ome_types import from_xml, to_xml
 
 import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
@@ -663,29 +666,130 @@ def vsi_background_subtract(vsi_path,
     run_commandline(f"raw2ometiff {raw_folder} {output_ometiff}", verbose=1, print_command=True)
 
 
-def vsi_to_zarr_batch(vsi_files_path,
-                      output_path,
+def generate_vsi_path_list(vsi_paths, csv_path='vsi_list.csv', append=True, display_table=True):
+    # Ensure vsi_paths is a list
+    if not isinstance(vsi_paths, list):
+        vsi_paths = [vsi_paths]
+
+    # Collect all .vsi files from the list of directories
+    vsi_path_list = []
+    for path in vsi_paths:
+        vsi_path_list.extend(glob(os.path.join(path, "*.vsi")))
+
+    # Extract filenames without extension
+    vsi_files = [Path(x).stem for x in vsi_path_list]
+
+    # Create dataframe
+    df = pd.DataFrame({
+        'Filename': vsi_files,
+        'Path': vsi_path_list,
+        'Include': [True] * len(vsi_files),
+        'Rename': [""] * len(vsi_files)
+    }).set_index('Filename')
+
+    # If CSV doesn't exist, save new
+    if not os.path.exists(csv_path):
+        df.to_csv(csv_path)
+        print(f"Created new CSV at {csv_path}")
+
+    # If CSV exists and appending
+    elif append:
+        df_exist = pd.read_csv(csv_path, index_col=0)
+        df_merged = pd.concat([df, df_exist])
+
+        # Remove duplicates, keeping the first occurrence
+        df_merged = df_merged[~df_merged.index.duplicated(keep='first')]
+
+        df_merged.to_csv(csv_path)
+        print(f"Appended new entries to {csv_path}, duplicates removed if any found")
+        df = df_merged
+
+    else:
+        print(f"Existing file found: {csv_path}. No changes made.")
+        df = pd.read_csv(csv_path, index_col=0)
+
+    if display_table:
+        with pd.option_context('display.max_rows', None, 'display.max_columns', None):
+            display(HTML(df.to_html()))
+
+    return
+
+
+def is_valid_folder_name(name):
+    # Check for common invalid folder name characters across major OS
+    return bool(re.match(r'^[^<>:"/\\|?*]+$', name)) and name.strip() != ""
+
+def vsi_to_zarr_batch(output_path,
+                      vsi_list="vsi_list.csv",
+                      vsi_files_path=None,
                       vsi_series=2,
                       patch_size=1024,
                       max_workers=8,
-                      overwrite=True):
+                      overwrite=True,
+                      rename=True):
     """
-    Converts all .vsi files in a folder to zarr using bioformats2raw.
+    Converts all .vsi files in a folder to Zarr using bioformats2raw.
     Each .vsi file gets its own subfolder inside output_path.
     """
-    vsi_files = glob(os.path.join(vsi_files_path, "*.vsi"))
-    if not vsi_files:
-        print(f"No .vsi files found in {vsi_files_path}")
-        return
 
-    print(f'{len(vsi_files)} .vsi files found in {str(vsi_files_path)}')
+    if vsi_files_path:
+        vsi_files = glob(os.path.join(vsi_files_path, "*.vsi"))
+        if not vsi_files:
+            print(f"No .vsi files found in {vsi_files_path}")
+            return
 
+    vsi_df = None
+    if vsi_list and os.path.exists(vsi_list):
+        vsi_df = pd.read_csv(vsi_list, index_col=0)
+
+        if 'Include' not in vsi_df.columns:
+            print("Warning: 'Include' column missing from VSI list. Assuming all True.")
+            vsi_df['Include'] = True
+
+        if 'Path' not in vsi_df.columns:
+            raise ValueError("CSV must contain a 'Path' column.")
+
+        if rename:
+            if 'Rename' not in vsi_df.columns:
+                raise ValueError("Rename column is required but missing in the VSI list.")
+
+            missing = vsi_df[vsi_df.Include & vsi_df.Rename.isnull()]
+            if not missing.empty:
+                raise ValueError(f"The following included files are missing Rename values:\n{missing.index.tolist()}")
+
+            renames = vsi_df.loc[vsi_df.Include, 'Rename']
+            if renames.duplicated().any():
+                raise ValueError("Duplicate entries found in Rename column.")
+
+            invalid_names = [r for r in renames if not is_valid_folder_name(r)]
+            if invalid_names:
+                raise ValueError(f"Invalid folder names found in Rename column: {invalid_names}")
+
+        num_inc = vsi_df.Include.sum()
+        num_exc = (~vsi_df.Include).sum()
+        print(f'Using stored VSI include list. # included: {num_inc}, # excluded: {num_exc}')
+
+        # Filter only included files using absolute paths
+        vsi_include_paths = vsi_df.loc[vsi_df.Include, 'Path'].tolist()
+        vsi_files = [x for x in vsi_files if x in vsi_include_paths]
+
+    else:
+        if vsi_list:
+            print(f"Warning: VSI list {vsi_list} not found. Proceeding with all files.")
+
+    print(f'{len(vsi_files)} .vsi files to process from {vsi_files_path}')
     os.makedirs(output_path, exist_ok=True)
 
     for vsi_path in vsi_files:
         base_name = os.path.splitext(os.path.basename(vsi_path))[0]
-        raw_folder = os.path.join(output_path, base_name)
 
+        if rename and vsi_df is not None:
+            if base_name in vsi_df.index:
+                new_name = vsi_df.loc[base_name, 'Rename']
+                if pd.notnull(new_name):
+                    base_name = new_name
+
+        raw_folder = os.path.join(output_path, base_name)
         print(f"\nProcessing {vsi_path} → {raw_folder}")
 
         # Get metadata
@@ -697,6 +801,7 @@ def vsi_to_zarr_batch(vsi_files_path,
         )
         series_metadata = parse_showinf_series_metadata(showinf_readout, series_number=vsi_series)
 
+        # Run bioformats2raw conversion
         if not os.path.isdir(raw_folder) or overwrite:
             print(f"\nConverting {vsi_path} to Zarr folder...")
             run_commandline(
@@ -708,12 +813,6 @@ def vsi_to_zarr_batch(vsi_files_path,
             )
         else:
             print(f"Zarr folder already exists at {raw_folder}; skipping (set overwrite=True to force)")
-
-
-
-
-
-
 
 
 # Generate the complete region crop tool for WSI using napari + zarr + dask
@@ -1055,8 +1154,7 @@ def copy_metadata_structure(zarr_path, region_out_path, zarr_level="0"):
             shutil.copy2(src_file, dst_file)
             print(f"📄 Copied {zarr_level}/ level {fname}")
 
-from ome_types import from_xml, to_xml
-import os
+
 
 def update_ome_xml_dimensions(region_path, shape, dtype="uint16"):
     """
@@ -1109,7 +1207,8 @@ def process_all_zarrs_and_regions(
     zarr_level="0",
     dtype='uint16',
     pyramid_levels=None,
-    rename_files=False
+    rename_files=False,
+    vsi_csv = 'vsi_include_list.csv'
 ):
     os.makedirs(zarr_crops_path, exist_ok=True)
     if convert_to_ome_tiff:
@@ -1123,22 +1222,25 @@ def process_all_zarrs_and_regions(
     # Load or generate rename map
     rename_map = {}
     if rename_files:
-        rename_csv = "vsi_rename.csv"
-        if not os.path.exists(rename_csv):
-            df = pd.DataFrame(index=zarr_folders)
-            df["rename"] = ""
-            df.to_csv(rename_csv)
-            print(f"⚠️ Created template {rename_csv}. Please fill it and re-run.")
+        if not os.path.exists(vsi_csv):
+            df = pd.DataFrame(index=zarr_folders).rename_axis('Filename')
+            df["Rename"] = ""
+            df.to_csv(vsi_csv)
+            print(f"⚠️ Created template {vsi_csv}. Please fill it and re-run.")
             return
 
-        df = pd.read_csv(rename_csv, index_col=0)
-        missing = [zf for zf in zarr_folders if zf not in df.index or not isinstance(df.loc[zf, 'rename'], str) or df.loc[zf, 'rename'].strip() == ""]
+        df = pd.read_csv(vsi_csv, index_col=0)
+
+        if 'Include' in df.columns:
+            df = df.loc[df['Include'] == True, :]
+
+        missing = [zf for zf in zarr_folders if zf not in df.index or not isinstance(df.loc[zf, 'Rename'], str) or df.loc[zf, 'Rename'].strip() == ""]
         if missing:
             print(f"⚠️ Rename entries missing for: {missing}")
-            print(f"Please update {rename_csv} and re-run.")
+            print(f"Please update {vsi_csv} and re-run.")
             return
 
-        rename_map = df["rename"].to_dict()
+        rename_map = df["Rename"].to_dict()
 
     for zarr_name in zarr_folders:
         zarr_path = os.path.join(zarr_path_root, zarr_name)
