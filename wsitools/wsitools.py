@@ -1272,14 +1272,19 @@ def process_all_zarrs_and_regions(
             with open(region_file, "r") as f:
                 region_info = json.load(f)
 
-            ymin = region_info["ymin"]
-            ymax = region_info["ymax"]
-            xmin = region_info["xmin"]
-            xmax = region_info["xmax"]
+            ymin = max(0, region_info["ymin"])
+            ymax = min(fullres.shape[-2], region_info["ymax"])
+            xmin = max(0, region_info["xmin"])
+            xmax = min(fullres.shape[-1], region_info["xmax"])
 
-            print(f"✂️  Cropping {zarr_name} — {region_id} → Y: {ymin}-{ymax}, X: {xmin}-{xmax}")
+            if ymin >= ymax or xmin >= xmax:
+                print(f"⚠️ Skipping region {region_id} — invalid crop area after bounding.")
+                continue
+
+            print(f"✂️ Cropping {zarr_name} — {region_id} → Y: {ymin}-{ymax}, X: {xmin}-{xmax}")
 
             cropped = fullres[:, :, :, ymin:ymax, xmin:xmax].compute()
+
             pyramid = build_pyramid_numpy(cropped, num_levels=pyramid_levels)
 
             out_crop_name = f"{base_name}_{region_id}"
