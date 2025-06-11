@@ -44,7 +44,13 @@ from skimage.io import imsave
 from skimage.morphology import opening as grey_opening
 from skimage.transform import downscale_local_mean
 
+from tifffile import TiffFile
+
 import zarr
+
+
+
+
 
 def add_java_paths(java_paths=None):
     """Add Java-related tool paths to environment and report status."""
@@ -1322,93 +1328,105 @@ def process_all_zarrs_and_regions(
         shutil.rmtree(zarr_crops_path)
 
 
-from skimage.io import imsave
-from skimage.exposure import rescale_intensity
-import numpy as np
-import os
-import zarr
-import dask.array as da
-from pathlib import Path
-
-def generate_summary_pngs_from_zarrs(
-    zarr_root,
-    output_dir="zarr_summary_pngs",
-    zarr_level="0",
+def generate_summary_pngs(
+    input_dir,
+    output_dir="summary_pngs",
     display_level=8,
     quantile=0.95,
     squash_channels=False,
-    max_images=None
+    max_images=None,
+    zarr_level="0"
 ):
     """
-    Generate PNG summary images from Zarr folders at a specified resolution level.
+    Generate summary PNGs from a folder of OME-TIFFs or Zarr folders.
 
     Parameters:
-    - zarr_root: folder containing multiple zarr folders
-    - output_dir: where to save .png summary images
-    - zarr_level: subfolder level in Zarr (default "0")
-    - display_level: pyramid level (integer) to visualize
-    - quantile: percentile-based contrast stretching (0–1)
-    - squash_channels: if True, collapses all channels into a single grayscale image
-    - max_images: optionally limit the number of Zarr folders processed
+    - input_dir: folder containing either .ome.tiff files or Zarr folders
+    - output_dir: where to save PNGs
+    - display_level: pyramid level to use (higher = more downsampled)
+    - quantile: quantile to use for contrast stretching (0.95 = 95th percentile)
+    - squash_channels: sum all channels into grayscale
+    - max_images: optional limit on number of images
+    - zarr_level: subfolder level inside Zarr (usually "0")
     """
 
-    os.makedirs(output_dir, exist_ok=True)
-    zarr_folders = sorted([f for f in os.listdir(zarr_root) if os.path.isdir(os.path.join(zarr_root, f))])
+    input_dir = Path(input_dir)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(exist_ok=True)
+
+    # --- Auto-detect format ---
+    entries = sorted(list(input_dir.glob("*.ome.tif*")))
+    from_format = "ometiff" if entries else "zarr"
+    if not entries:
+        entries = sorted([p for p in input_dir.iterdir() if (p / zarr_level).exists()])
+
+    if not entries:
+        print("❌ No OME-TIFFs or Zarr folders found.")
+        return
 
     if max_images:
-        zarr_folders = zarr_folders[:max_images]
+        entries = entries[:max_images]
 
-    for zarr_name in zarr_folders:
+    print(f"📂 Detected format: {from_format} — processing {len(entries)} items")
+
+    for entry in entries:
         try:
-            path = os.path.join(zarr_root, zarr_name, zarr_level, str(display_level))
-            arr = da.from_zarr(path)
+            name = entry.stem
+            if from_format == "zarr":
+                arr_path = entry / zarr_level / str(display_level)
+                arr = da.from_zarr(str(arr_path))
 
-            # Assume shape (T, C, Z, Y, X); take first T/Z if necessary
-            if arr.ndim == 5:
-                arr = arr[0, :, 0, :, :]  # (C, Y, X)
-            elif arr.ndim == 4:
-                arr = arr[0, :, :, :]    # (C, Y, X)
+                if arr.ndim == 5:
+                    arr = arr[0, :, 0, :, :]  # (C, Y, X)
+                elif arr.ndim == 4:
+                    arr = arr[0, :, :, :]     # (C, Y, X)
 
-            arr_np = arr.compute().astype(np.float32)
+                data = arr.compute().astype(np.float32)
 
+            else:  # OME-TIFF
+                with TiffFile(str(entry)) as tif:
+                    series = tif.series[0]
+                    levels = series.levels
+                    level = levels[min(display_level, len(levels) - 1)]
+                    data = level.asarray().astype(np.float32)
+
+                    if data.ndim == 2:
+                        data = data[np.newaxis, ...]
+                    elif data.ndim == 3 and data.shape[-1] in (1, 3, 4):
+                        data = data.transpose(2, 0, 1)  # (C, Y, X)
+
+            # --- Normalize and optionally squash ---
             if squash_channels:
-                combined = np.sum(arr_np, axis=0)
-                vmin = np.percentile(combined, 0)
-                vmax = np.percentile(combined, quantile * 100)
-                normalized = np.clip((combined - vmin) / (vmax - vmin), 0, 1)
-                gray_img = (normalized * 255).astype(np.uint8)
-                rgb = np.stack([gray_img]*3, axis=-1)
+                combined = np.sum(data, axis=0)
+                vmin, vmax = np.percentile(combined, [0, quantile * 100])
+                img = np.clip((combined - vmin) / (vmax - vmin), 0, 1)
+                img_uint8 = (img * 255).astype(np.uint8)
+                rgb = np.stack([img_uint8] * 3, axis=-1)
 
-            elif arr_np.shape[0] == 1:
-                # Single channel grayscale
-                ch = arr_np[0]
-                vmin = np.percentile(ch, 0)
-                vmax = np.percentile(ch, quantile * 100)
-                ch = np.clip((ch - vmin) / (vmax - vmin), 0, 1)
-                gray = (ch * 255).astype(np.uint8)
-                rgb = np.stack([gray]*3, axis=-1)
+            elif data.shape[0] == 1:
+                ch = data[0]
+                vmin, vmax = np.percentile(ch, [0, quantile * 100])
+                norm = np.clip((ch - vmin) / (vmax - vmin), 0, 1)
+                rgb = np.stack([(norm * 255).astype(np.uint8)] * 3, axis=-1)
 
             else:
-                # RGB-style with contrast stretching
                 channels = []
-                for ch in arr_np[:3]:
-                    vmin = np.percentile(ch, 0)
-                    vmax = np.percentile(ch, quantile * 100)
-                    ch = np.clip((ch - vmin) / (vmax - vmin), 0, 1)
-                    channels.append((ch * 255).astype(np.uint8))
-
+                for ch in data[:3]:
+                    vmin, vmax = np.percentile(ch, [0, quantile * 100])
+                    ch_norm = np.clip((ch - vmin) / (vmax - vmin), 0, 1)
+                    channels.append((ch_norm * 255).astype(np.uint8))
                 while len(channels) < 3:
                     channels.append(np.zeros_like(channels[0]))
+                rgb = np.stack(channels[:3], axis=-1)
 
-                rgb = np.stack(channels, axis=-1)
-
-            # Save PNG
-            png_path = os.path.join(output_dir, f"{zarr_name}.png")
-            imsave(png_path, rgb)
-            print(f"✅ Saved summary PNG: {png_path}")
+            save_path = output_dir / f"{name}.png"
+            imsave(str(save_path), rgb)
+            print(f"✅ Saved summary: {save_path.name}")
 
         except Exception as e:
-            print(f"❌ Failed to generate PNG for {zarr_name}: {e}")
+            print(f"❌ Failed for {entry.name}: {e}")
+
+
 
 
 
