@@ -1322,6 +1322,97 @@ def process_all_zarrs_and_regions(
         shutil.rmtree(zarr_crops_path)
 
 
+from skimage.io import imsave
+from skimage.exposure import rescale_intensity
+import numpy as np
+import os
+import zarr
+import dask.array as da
+from pathlib import Path
+
+def generate_summary_pngs_from_zarrs(
+    zarr_root,
+    output_dir="zarr_summary_pngs",
+    zarr_level="0",
+    display_level=8,
+    quantile=0.95,
+    squash_channels=False,
+    max_images=None
+):
+    """
+    Generate PNG summary images from Zarr folders at a specified resolution level.
+
+    Parameters:
+    - zarr_root: folder containing multiple zarr folders
+    - output_dir: where to save .png summary images
+    - zarr_level: subfolder level in Zarr (default "0")
+    - display_level: pyramid level (integer) to visualize
+    - quantile: percentile-based contrast stretching (0–1)
+    - squash_channels: if True, collapses all channels into a single grayscale image
+    - max_images: optionally limit the number of Zarr folders processed
+    """
+
+    os.makedirs(output_dir, exist_ok=True)
+    zarr_folders = sorted([f for f in os.listdir(zarr_root) if os.path.isdir(os.path.join(zarr_root, f))])
+
+    if max_images:
+        zarr_folders = zarr_folders[:max_images]
+
+    for zarr_name in zarr_folders:
+        try:
+            path = os.path.join(zarr_root, zarr_name, zarr_level, str(display_level))
+            arr = da.from_zarr(path)
+
+            # Assume shape (T, C, Z, Y, X); take first T/Z if necessary
+            if arr.ndim == 5:
+                arr = arr[0, :, 0, :, :]  # (C, Y, X)
+            elif arr.ndim == 4:
+                arr = arr[0, :, :, :]    # (C, Y, X)
+
+            arr_np = arr.compute().astype(np.float32)
+
+            if squash_channels:
+                combined = np.sum(arr_np, axis=0)
+                vmin = np.percentile(combined, 0)
+                vmax = np.percentile(combined, quantile * 100)
+                normalized = np.clip((combined - vmin) / (vmax - vmin), 0, 1)
+                gray_img = (normalized * 255).astype(np.uint8)
+                rgb = np.stack([gray_img]*3, axis=-1)
+
+            elif arr_np.shape[0] == 1:
+                # Single channel grayscale
+                ch = arr_np[0]
+                vmin = np.percentile(ch, 0)
+                vmax = np.percentile(ch, quantile * 100)
+                ch = np.clip((ch - vmin) / (vmax - vmin), 0, 1)
+                gray = (ch * 255).astype(np.uint8)
+                rgb = np.stack([gray]*3, axis=-1)
+
+            else:
+                # RGB-style with contrast stretching
+                channels = []
+                for ch in arr_np[:3]:
+                    vmin = np.percentile(ch, 0)
+                    vmax = np.percentile(ch, quantile * 100)
+                    ch = np.clip((ch - vmin) / (vmax - vmin), 0, 1)
+                    channels.append((ch * 255).astype(np.uint8))
+
+                while len(channels) < 3:
+                    channels.append(np.zeros_like(channels[0]))
+
+                rgb = np.stack(channels, axis=-1)
+
+            # Save PNG
+            png_path = os.path.join(output_dir, f"{zarr_name}.png")
+            imsave(png_path, rgb)
+            print(f"✅ Saved summary PNG: {png_path}")
+
+        except Exception as e:
+            print(f"❌ Failed to generate PNG for {zarr_name}: {e}")
+
+
+
+
 
 def organize_ometiffs(ometiffs_path="ometiffs", reverse=False):
     """
