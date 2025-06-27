@@ -49,9 +49,6 @@ from tifffile import TiffFile
 import zarr
 
 
-
-
-
 def add_java_paths(java_paths=None):
     """Add Java-related tool paths to environment and report status."""
 
@@ -1510,3 +1507,44 @@ def organize_ometiffs(ometiffs_path="ometiffs", reverse=False):
 
     print("✅ OME-TIFFs organized into subfolders.")
 
+
+def vsi_to_slidelabels(temp_zarr_path='temp',
+                       image_output_path='slidelabels',
+                      vsi_files_path=None,
+                      vsi_series=0,
+                      patch_size=1024,
+                      max_workers=8):
+    """
+    Converts all .vsi files in a folder to Zarr using bioformats2raw.
+    Each .vsi file gets its own subfolder inside output_path.
+    """
+
+    if vsi_files_path:
+        vsi_files = glob(os.path.join(vsi_files_path, "*.vsi"))
+        if not vsi_files:
+            print(f"No .vsi files found in {vsi_files_path}")
+            return
+
+    print(f'{len(vsi_files)} .vsi files to process from {vsi_files_path}')
+    os.makedirs(temp_zarr_path, exist_ok=True)
+
+    for vsi_path in vsi_files:
+        base_name = os.path.splitext(os.path.basename(vsi_path))[0]
+
+        temp_zarr_folder = os.path.join(temp_zarr_path, base_name)
+        print(f"\nProcessing \"{vsi_path}\" → {temp_zarr_folder}")
+
+        # Run bioformats2raw conversion
+        print(f"\nConverting \"{vsi_path}\" to Zarr folder...")
+        run_commandline(
+            f"bioformats2raw --overwrite "
+            f"--tile-width {patch_size} --max-workers {max_workers} "
+            f"--series {vsi_series} \"{vsi_path}\" {temp_zarr_folder}",
+            verbose=1,
+            print_command=True
+        )
+
+        tiff_path = os.path.join(image_output_path, (base_name + ".ome.tiff"))
+
+        command = f"raw2ometiff {temp_zarr_folder} {tiff_path}"
+        run_commandline(command, verbose=0, print_command=True)
