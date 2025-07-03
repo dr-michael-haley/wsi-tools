@@ -1509,7 +1509,7 @@ def organize_ometiffs(ometiffs_path="ometiffs", reverse=False):
 
 
 def vsi_to_slidelabels(temp_zarr_path='temp',
-                       image_output_path='slidelabels',
+                      image_output_path='slidelabels',
                       vsi_files_path=None,
                       vsi_series=0,
                       patch_size=1024,
@@ -1527,6 +1527,7 @@ def vsi_to_slidelabels(temp_zarr_path='temp',
 
     print(f'{len(vsi_files)} .vsi files to process from {vsi_files_path}')
     os.makedirs(temp_zarr_path, exist_ok=True)
+    os.makedirs(image_output_path, exist_ok=True)
 
     for vsi_path in vsi_files:
         base_name = os.path.splitext(os.path.basename(vsi_path))[0]
