@@ -30,7 +30,7 @@ import pandas as pd
 
 from magicgui import magicgui, widgets
 
-from ome_types import from_xml
+from ome_types import from_xml, from_tiff
 from ome_types.model import OME, Image, Pixels, Channel, TiffData
 
 from qtpy.QtCore import QTimer
@@ -47,7 +47,6 @@ from skimage.transform import downscale_local_mean
 from tifffile import TiffFile
 
 import zarr
-
 
 def add_java_paths(java_paths=None):
     """Add Java-related tool paths to environment and report status."""
@@ -1549,3 +1548,46 @@ def vsi_to_slidelabels(temp_zarr_path='temp',
 
         command = f"raw2ometiff {temp_zarr_folder} {tiff_path}"
         run_commandline(command, verbose=0, print_command=True)
+
+
+def extract_channel_from_ome_tiff(input_path, channel_name, output_path):
+    """
+    Extracts a named channel from an OME-TIFF file and saves it as a new TIFF.
+
+    Parameters:
+        input_path (str): Path to the input OME-TIFF file.
+        channel_name (str): Name of the channel to extract.
+        output_path (str): Path to save the extracted channel as a TIFF.
+    """
+    # Load the OME metadata
+    ome_metadata = from_tiff(input_path)
+    
+    # Find the index of the channel with the specified name
+    channels = ome_metadata.images[0].pixels.channels
+    channel_names = [ch.name for ch in channels]
+    
+    if channel_name not in channel_names:
+        raise ValueError(f"Channel '{channel_name}' not found. Available channels: {channel_names}")
+    
+    channel_index = channel_names.index(channel_name)
+
+    # Read the image data
+    with tifffile.TiffFile(input_path) as tif:
+        data = tif.asarray()
+
+        # Check for expected 5D shape (T, Z, C, Y, X) or similar
+        shape = data.shape
+        if data.ndim == 5:  # e.g., (T, Z, C, Y, X)
+            # Extract all timepoints and Z-slices for this channel
+            channel_data = data[:, :, channel_index, :, :]
+        elif data.ndim == 4:  # e.g., (Z, C, Y, X)
+            channel_data = data[:, channel_index, :, :]
+        elif data.ndim == 3 and len(channels) > 1:  # e.g., (C, Y, X)
+            channel_data = data[channel_index, :, :]
+        else:
+            raise RuntimeError(f"Unexpected OME-TIFF shape: {shape}")
+    
+    # Save the extracted channel as a new TIFF
+    tifffile.imwrite(output_path, channel_data, photometric='minisblack')
+
+    print(f"Channel '{channel_name}' saved to '{output_path}'")
