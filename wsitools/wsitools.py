@@ -45,6 +45,7 @@ from skimage.morphology import opening as grey_opening
 from skimage.transform import downscale_local_mean
 
 from tifffile import TiffFile
+import tifffile
 
 import zarr
 
